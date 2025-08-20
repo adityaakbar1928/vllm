@@ -1,0 +1,26 @@
+# Virtual Environment
+venv/
+__pycache__/
+
+# Docker & Build artifacts
+.dockerignore
+Dockerfile.prod
+.venv
+
+# Data & Cache (tidak perlu di-version control)
+vectorstore/
+data/
+*.db
+hf_cache/
+
+# File IDE & OS
+.vscode/
+.idea/
+.DS_Store
+
+# File Environment (JANGAN PERNAH PUSH KUNCI API)
+.env
+*.env
+
+# File log
+*.log

@@ -1,0 +1,27 @@
+# Backend & Server
+fastapi
+uvicorn[standard]
+gunicorn
+pydantic-settings
+pydantic
+
+# LLM & Inference
+vllm
+
+# RAG & VectorDB
+langchain
+langchain-community
+langchain-huggingface
+sentence-transformers
+faiss-cpu
+
+# Observability
+langfuse
+
+# Frontend
+streamlit
+
+numpy
+pandas
+scikit-learn
+requests
