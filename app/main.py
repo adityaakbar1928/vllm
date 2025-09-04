@@ -1,28 +1,26 @@
-import os, time, uuid
-from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+# app/main.py
+import os, time, uuid, json, re
+from typing import List, Optional, Dict, Any, Literal
 
-# ================== ENV ==================
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# ===================== ENV =====================
 APP_ENV       = os.getenv("APP_ENV", "production").lower()
 MODEL_NAME    = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
-GPU_MEM_UTIL  = float(os.getenv("GPU_MEM_UTIL", "0.22"))   # kecil biar aman di GPU shared
-MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", "4096"))    # bisa dinaikkan bertahap
+GPU_MEM_UTIL  = float(os.getenv("GPU_MEM_UTIL", "0.6"))
+MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", "8192"))
 TEMP          = float(os.getenv("TEMP", "0.7"))
 TOP_P         = float(os.getenv("TOP_P", "0.95"))
-MAX_TOKENS    = int(os.getenv("MAX_TOKENS", "1024"))
+MAX_TOKENS    = int(os.getenv("MAX_TOKENS", "512"))
 SHOW_TPS      = os.getenv("SHOW_TPS", "true").lower() == "true"
+API_KEY       = os.getenv("API_KEY", "jakarta321")
+ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")
 HF_TOKEN      = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-RAG_MODE      = os.getenv("RAG_MODE", "off").lower()       # off|on|auto (non-strict)
-API_KEY       = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")  # e.g. "jakarta321"
+RAG_MODE      = os.getenv("RAG_MODE", "off").lower()   # off | on | auto
 
-# vLLM tuning untuk footprint GPU
-KV_CACHE_DTYPE = os.getenv("KV_CACHE_DTYPE", "fp8")        # fp8|fp16|bf16|auto
-SWAP_SPACE_GB  = int(os.getenv("SWAP_SPACE", "0"))         # 0=off; 8..16 kalau mau offload KV ke RAM
-
-# ===== Pydantic =====
+# ===================== Schemas =====================
 class ChatRequest(BaseModel):
     prompt: str
 
@@ -36,7 +34,19 @@ class BenchRequest(BaseModel):
 # OpenAI-compatible
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+
+class ToolFunction(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+class ToolSpec(BaseModel):
+    # Pydantic v2: gunakan Literal, jangan Field(..., const=True)
+    type: Literal["function"] = "function"
+    function: ToolFunction
 
 class ChatCompletionsRequest(BaseModel):
     model: Optional[str] = None
@@ -44,16 +54,10 @@ class ChatCompletionsRequest(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    tools: Optional[List[ToolSpec]] = None
+    tool_choice: Optional[Any] = None  # "none" | "auto" | {"type":"function","function":{"name":"..."}}
 
-# ===== Auth (OpenAI style) =====
-bearer = HTTPBearer(auto_error=False)
-def require_api_key(auth: HTTPAuthorizationCredentials = Depends(bearer)):
-    if not API_KEY:
-        return  # tanpa API key, endpoint tetap terbuka
-    if not auth or not auth.credentials or auth.credentials != API_KEY:
-        raise HTTPException(401, "Invalid API key")
-
-# ===== Tokenizer (opsional) =====
+# ===================== Tokenizer helpers =====================
 tokenizer = None
 chat_tmpl_ok = False
 
@@ -72,55 +76,74 @@ try:
 except Exception as e:
     print(f"[Tokenizer] init error: {e} (lanjut tanpa tokenizer)")
 
-def to_prompt_from_messages(messages: List[Dict[str, str]]) -> str:
-    # Pakai chat_template kalau ada
+def to_prompt_from_messages(messages: List[Dict[str,str]]) -> str:
+    """Pakai chat_template kalau ada, fallback format aman."""
     if tokenizer and chat_tmpl_ok:
         try:
             return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception as e:
             print(f"[ChatTemplate] apply failed: {e} (fallback)")
-    # fallback format sederhana
+    # fallback sederhana
     parts = []
     for m in messages:
-        role = m.get("role", "user").upper()
-        content = m.get("content", "")
-        parts.append(f"{role}: {content}")
+        role = m.get("role","user")
+        content = m.get("content","")
+        parts.append(f"{role.upper()}: {content}")
     parts.append("ASSISTANT:")
     return "\n".join(parts)
 
-# ===== RAG (opsional, non-strict) =====
+# ===================== LLM init (no lazy) =====================
+llm = None
+sampling_params = None
+vllm_last_error: Optional[str] = None
+
+if APP_ENV == "local":
+    class MockLLM:
+        def generate(self, prompt_template: str, sampling_params: object):
+            time.sleep(0.1)
+            class _O:  # minimal output shape
+                def __init__(self, t): self.text=t
+            class _R:
+                def __init__(self, t): self.outputs=[_O(t)]
+            return [_R("Ini jawaban mock. (ENV=local)")]
+    llm = MockLLM()
+else:
+    try:
+        from vllm import LLM, SamplingParams
+        llm = LLM(
+            model=MODEL_NAME,
+            trust_remote_code=True,
+            max_model_len=MAX_MODEL_LEN,
+            gpu_memory_utilization=GPU_MEM_UTIL,
+        )
+        sampling_params = SamplingParams(
+            temperature=TEMP,
+            top_p=TOP_P,
+            max_tokens=MAX_TOKENS,
+        )
+    except Exception as e:
+        vllm_last_error = str(e)
+        print(f"[LLM] init error: {e}")
+
+# ===================== RAG (optional, non-strict) =====================
 retriever = None
-def _rag_noop_list(): return []
-def _rag_noop_ingest(_files): return {"saved": [], "reindexed": False}
-def _rag_noop_delete(_id): return None
-def _rag_noop_get(): return None
-def _rag_noop_ensure(): return None
-
-list_documents     = _rag_noop_list
-ingest_documents   = _rag_noop_ingest
-delete_document    = _rag_noop_delete
-get_retriever      = _rag_noop_get
-ensure_vector_db_ready = _rag_noop_ensure
-
 try:
     from rag_processor import (
-        get_retriever as _get_ret,
-        ensure_vector_db_ready as _ensure,
-        ingest_documents as _ingest,
-        list_documents as _list,
-        delete_document as _del,
+        get_retriever, ensure_vector_db_ready,
+        ingest_documents, list_documents, delete_document
     )
-    ensure_vector_db_ready = _ensure
-    ingest_documents       = _ingest
-    list_documents         = _list
-    delete_document        = _del
     ensure_vector_db_ready()
-    retriever = _get_ret()
+    retriever = get_retriever()
 except Exception as e:
     print(f"[RAG] init warning: {e} (RAG tetap opsional)")
 
-def build_messages_with_optional_context(user_prompt: str) -> List[Dict[str, str]]:
-    """Non-strict RAG: kalau ada konteks, pakai; kalau tidak, jawab dg pengetahuan umum."""
+def build_messages_with_optional_context(user_prompt: str):
+    """
+    Non-strict:
+      - RAG_MODE=off  → tanpa konteks.
+      - RAG_MODE=on   → coba ambil konteks; bila kosong, tetap jawab pakai general knowledge.
+      - RAG_MODE=auto → ambil konteks; kalau tak relevan, tetap jawab pakai general knowledge.
+    """
     context = ""
     if RAG_MODE in ("on", "auto") and retriever is not None:
         try:
@@ -133,82 +156,116 @@ def build_messages_with_optional_context(user_prompt: str) -> List[Dict[str, str
     system_msg = {
         "role": "system",
         "content": (
-            "You are a helpful assistant. Prefer using the provided context if relevant. "
-            "If context is missing/insufficient, answer from your general knowledge. "
+            "You are a helpful assistant. If a 'Context' section is provided and relevant, use it. "
+            "If context is missing or insufficient, answer using your general knowledge clearly. "
             "If unsure, say you are unsure."
-        ),
+        )
     }
     user_content = user_prompt if not context else f"Context:\n{context}\n\nQuestion:\n{user_prompt}"
-    return [system_msg, {"role": "user", "content": user_content}]
+    user_msg = {"role":"user","content": user_content}
+    return [system_msg, user_msg]
 
-# ===== vLLM INIT — EAGER (NO LAZY) =====
-llm = None
-sampling_params = None
-VLLM_READY = False
-VLLM_LAST_ERROR: Optional[str] = None
-
-if APP_ENV == "local":
-    class _MockOut:  # mock untuk dev lokal
-        def __init__(self, t): self.text = t
-    class _MockRes:
-        def __init__(self, t): self.outputs = [_MockOut(t)]
-    class MockLLM:
-        def generate(self, prompt_template: str, sampling_params: object):
-            time.sleep(0.1)
-            return [_MockRes("Ini jawaban mock. (ENV=local)")]
-
-    llm = MockLLM()
-    from types import SimpleNamespace
-    sampling_params = SimpleNamespace(temperature=TEMP, top_p=TOP_P, max_tokens=MAX_TOKENS)
-    VLLM_READY = True
-else:
+# ===================== Tool-calling helpers =====================
+def _extract_json_first(s: str) -> Optional[dict]:
+    """Ekstrak objek JSON pertama secara robust (tanpa regex recursive)."""
+    s = (s or "").strip()
+    # strip code fences
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_+-]*", "", s).strip()
+        if s.endswith("```"):
+            s = s[:-3]
+    # coba parse full
     try:
-        from vllm import LLM, SamplingParams
-        llm = LLM(
-            model=MODEL_NAME,
-            trust_remote_code=True,
-            max_model_len=MAX_MODEL_LEN,
-            gpu_memory_utilization=GPU_MEM_UTIL,
-            kv_cache_dtype=KV_CACHE_DTYPE,   # hemat KV di GPU shared (H100: fp8 ok)
-            swap_space=SWAP_SPACE_GB,        # opsional offload KV ke RAM
-        )
-        sampling_params = SamplingParams(
-            temperature=TEMP,
-            top_p=TOP_P,
-            max_tokens=MAX_TOKENS,
-        )
-    except Exception as e:
-        VLLM_LAST_ERROR = str(e)
-        print(f"[LLM] init error: {e}")
+        return json.loads(s)
+    except Exception:
+        pass
+    # scan objek {...} pertama yang balanced
+    start = s.find("{")
+    while start != -1:
+        depth = 0
+        i = start
+        while i < len(s):
+            ch = s[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    cand = s[start:i+1]
+                    try:
+                        return json.loads(cand)
+                    except Exception:
+                        break
+            i += 1
+        start = s.find("{", start+1)
+    return None
 
-# ===== FastAPI App =====
-app = FastAPI(title="General LLM API (OpenAI-compatible)", version="1.1.0")
+def _tool_system_instructions(tools: List[ToolSpec], tool_choice: Optional[Any]) -> str:
+    tgt = None
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function", {})
+        tgt = fn.get("name")
+    lines = [
+        "TOOLS AVAILABLE:",
+        json.dumps({"tools":[t.model_dump() for t in tools]}, ensure_ascii=False),
+        "",
+        "If tools are provided:",
+        '- If you decide to call tool(s), output ONLY a single JSON object of the form:',
+        '  {"tool_calls":[{"type":"function","function":{"name":"<tool_name>","arguments":{...}}}, ...]}',
+        '- If no tool is needed, output ONLY: {"final":true,"content":"<your answer>"}',
+        "Do NOT add backticks. Do NOT add explanations outside JSON.",
+    ]
+    if tgt:
+        lines.append(f'Prefer calling function name "{tgt}" when appropriate.')
+    return "\n".join(lines)
+
+def _maybe_wrap_toolcall_response(text: str):
+    """Parse teks model → (tool_calls or final content)."""
+    data = _extract_json_first(text)
+    if isinstance(data, dict):
+        # tool_calls path
+        if "tool_calls" in data and isinstance(data["tool_calls"], list) and data["tool_calls"]:
+            tool_calls = []
+            for _tc in data["tool_calls"]:
+                if not isinstance(_tc, dict): continue
+                if _tc.get("type") != "function": continue
+                fn = _tc.get("function", {})
+                name = fn.get("name") or ""
+                args = fn.get("arguments")
+                if isinstance(args, (dict, list)):
+                    args = json.dumps(args, ensure_ascii=False)
+                if not isinstance(args, str):
+                    args = "{}"
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": args}
+                })
+            if tool_calls:
+                return {"tool_calls": tool_calls}
+        # final content path
+        if data.get("final") is True and isinstance(data.get("content"), str):
+            return {"final": data["content"]}
+    # fallback → treat as normal answer
+    return {"final": text}
+
+# ===================== Auth (Bearer) =====================
+def verify_bearer(req: Request):
+    auth = req.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "Invalid API key")
+    token = auth.split(" ", 1)[1].strip()
+    if token != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+
+# ===================== FastAPI app =====================
+app = FastAPI(title="General LLM API (OpenAI-compatible, Tools, optional RAG)", version="1.1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
 
-@app.on_event("startup")
-async def _warmup():
-    """Warm-up agar compile/graph capture selesai sebelum serve request pertama."""
-    global VLLM_READY, VLLM_LAST_ERROR
-    if llm is None:
-        return
-    try:
-        _ = llm.generate(
-            to_prompt_from_messages([
-                {"role":"system","content":"warmup"},
-                {"role":"user","content":"hi"},
-            ]),
-            sampling_params
-        )
-        VLLM_READY = True
-    except Exception as e:
-        VLLM_LAST_ERROR = str(e)
-        print(f"[Warmup] error: {e}")
-
-# ===== Health =====
 @app.get("/")
 def health():
     return {
@@ -217,13 +274,13 @@ def health():
         "model": MODEL_NAME,
         "rag_mode": RAG_MODE,
         "rag_available": bool(retriever),
-        "vllm_ready": VLLM_READY,
-        "vllm_last_error": VLLM_LAST_ERROR,
+        "vllm_ready": llm is not None,
+        "vllm_last_error": vllm_last_error,
     }
 
-# ===== OpenAI-compatible =====
+# ---------------- /v1/models ----------------
 @app.get("/v1/models")
-def list_models(_=Depends(require_api_key)):
+def list_models(_: None = Depends(verify_bearer)):
     return {
         "object": "list",
         "data": [{
@@ -234,76 +291,14 @@ def list_models(_=Depends(require_api_key)):
         }]
     }
 
-@app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionsRequest, _=Depends(require_api_key)):
-    if llm is None or not VLLM_READY:
-        raise HTTPException(503, "LLM not available.")
-    # gabungkan pesan user + system non-strict
-    messages = [{"role":"system","content":
-                 "You are a helpful assistant. Prefer context if present; otherwise use general knowledge."}]
-    messages += [{"role": m.role, "content": m.content} for m in req.messages]
-
-    # optional RAG hanya menambah system-context; tidak strict
-    try:
-        last_user = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
-        if RAG_MODE in ("on", "auto") and retriever is not None and last_user:
-            docs = retriever.invoke(last_user)
-            if docs:
-                ctx = "\n\n".join([d.page_content for d in docs])[:4000]
-                messages.append({"role":"system","content": f"Context:\n{ctx}"})
-    except Exception as e:
-        print(f"[RAG] optional ctx error: {e}")
-
-    prompt = to_prompt_from_messages(messages)
-    sp = sampling_params
-    if req.max_tokens or req.temperature or req.top_p:
-        from vllm import SamplingParams
-        sp = SamplingParams(
-            temperature=req.temperature if req.temperature is not None else TEMP,
-            top_p=req.top_p if req.top_p is not None else TOP_P,
-            max_tokens=req.max_tokens if req.max_tokens is not None else MAX_TOKENS,
-        )
-
-    t0 = time.perf_counter()
-    try:
-        out = llm.generate(prompt, sp)
-        text = out[0].outputs[0].text
-    except Exception as e:
-        print(f"[LLM] error: {e}")
-        raise HTTPException(500, "Inference error.")
-
-    dt = max(1e-6, time.perf_counter() - t0)
-    toks_in  = count_tokens(prompt)
-    toks_out = count_tokens(text)
-    return {
-        "id": f"chatcmpl-{uuid.uuid4()}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model or MODEL_NAME,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": toks_in,
-            "completion_tokens": toks_out,
-            "total_tokens": toks_in + toks_out
-        },
-        "metrics": (
-            {"latency_sec": round(dt,3), "tps_out": round(toks_out/dt,2)}
-            if SHOW_TPS else None
-        )
-    }
-
-# ===== Simple chat (tanpa format OpenAI) =====
+# ---------------- Simple chat ----------------
 @app.post("/v1/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, _=Depends(require_api_key)):
-    if llm is None or not VLLM_READY:
+async def chat(req: ChatRequest, _: None = Depends(verify_bearer)):
+    if llm is None:
         raise HTTPException(503, "LLM not available.")
     messages = build_messages_with_optional_context(req.prompt)
     prompt = to_prompt_from_messages(messages)
-    t0 = time.perf_counter()
+    t0=time.perf_counter()
     try:
         out = llm.generate(prompt, sampling_params)
         text = out[0].outputs[0].text
@@ -317,11 +312,98 @@ def chat(req: ChatRequest, _=Depends(require_api_key)):
                "tokens_out": toks_out, "tok_per_sec": round(toks_out/dt,2)} if SHOW_TPS else None
     return ChatResponse(response=text, metrics=metrics)
 
-# ===== Bench =====
-@app.post("/v1/bench")
-def bench(req: BenchRequest, _=Depends(require_api_key)):
-    if llm is None or not VLLM_READY:
+# ---------------- OpenAI-compatible chat/completions ----------------
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionsRequest, _: None = Depends(verify_bearer)):
+    if llm is None:
         raise HTTPException(503, "LLM not available.")
+
+    # Base system (general purpose)
+    base_sys = {
+        "role":"system",
+        "content":"You are a helpful assistant. Prefer provided context; if absent, answer with general knowledge clearly."
+    }
+    messages = [base_sys] + [m.model_dump() for m in req.messages]
+
+    # Optional RAG enrichment (non-strict)
+    try:
+        last_user = next((m["content"] for m in reversed(messages) if m.get("role")=="user"), "")
+        if RAG_MODE in ("on","auto") and retriever is not None and last_user:
+            docs = retriever.invoke(last_user)
+            if docs:
+                ctx = "\n\n".join([d.page_content for d in docs])[:4000]
+                messages.append({"role":"system","content": f"Context:\n{ctx}"})
+    except Exception as e:
+        print(f"[RAG] optional ctx error: {e}")
+
+    # Tools? → tambahkan instruksi supaya model mengeluarkan JSON tool_calls/final
+    if req.tools:
+        tool_sys = {"role":"system", "content": _tool_system_instructions(req.tools, req.tool_choice)}
+        messages = [tool_sys] + messages
+
+    prompt = to_prompt_from_messages(messages)
+
+    # Sampling override
+    sp = sampling_params
+    if req.max_tokens or req.temperature or req.top_p:
+        from vllm import SamplingParams
+        sp = SamplingParams(
+            temperature=req.temperature if req.temperature is not None else TEMP,
+            top_p=req.top_p if req.top_p is not None else TOP_P,
+            max_tokens=req.max_tokens if req.max_tokens is not None else MAX_TOKENS,
+        )
+
+    t0=time.perf_counter()
+    try:
+        out = llm.generate(prompt, sp)
+        text = out[0].outputs[0].text
+    except Exception as e:
+        print(f"[LLM] error: {e}")
+        raise HTTPException(500, "Inference error.")
+    dt = max(1e-6, time.perf_counter()-t0)
+
+    toks_in  = count_tokens(prompt)
+    toks_out = count_tokens(text)
+
+    # Post-process tools
+    tool_calls_block = None
+    final_content = None
+    if req.tools:
+        parsed = _maybe_wrap_toolcall_response(text)
+        if "tool_calls" in parsed:
+            tool_calls_block = parsed["tool_calls"]
+        else:
+            final_content = parsed.get("final", text)
+    else:
+        final_content = text
+
+    resp = {
+        "id": f"chatcmpl-{uuid.uuid4()}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model or MODEL_NAME,
+        "choices": [{
+            "index": 0,
+            "message": (
+                {"role":"assistant","content": None, "tool_calls": tool_calls_block}
+                if tool_calls_block is not None
+                else {"role":"assistant","content": final_content}
+            ),
+            "finish_reason": "tool_calls" if tool_calls_block is not None else "stop"
+        }],
+        "usage": {
+            "prompt_tokens": toks_in,
+            "completion_tokens": toks_out,
+            "total_tokens": toks_in + toks_out
+        },
+        "metrics": {"latency_sec": round(dt,3), "tps_out": round(toks_out/dt,2)} if SHOW_TPS else None
+    }
+    return resp
+
+# ---------------- Bench ----------------
+@app.post("/v1/bench")
+def bench(req: BenchRequest, _: None = Depends(verify_bearer)):
+    if llm is None: raise HTTPException(503, "LLM not available.")
     tms=[]
     for p in req.prompts:
         messages = build_messages_with_optional_context(p)
@@ -336,16 +418,20 @@ def bench(req: BenchRequest, _=Depends(require_api_key)):
         "max_tokens_param": MAX_TOKENS
     }
 
-# ===== RAG endpoints (opsional) =====
+# ---------------- RAG endpoints (opsional) ----------------
 @app.get("/v1/docs")
-def docs_list(_=Depends(require_api_key)):
+def docs_list(_: None = Depends(verify_bearer)):
+    if "list_documents" not in globals():
+        return {"items": []}
     try:
         return {"items": list_documents()}
     except Exception as e:
         raise HTTPException(500, f"Gagal baca daftar dokumen: {e}")
 
 @app.post("/v1/docs/upload")
-async def docs_upload(files: List[UploadFile] = File(...), _=Depends(require_api_key)):
+async def docs_upload(files: List[UploadFile] = File(...), _: None = Depends(verify_bearer)):
+    if "ingest_documents" not in globals():
+        raise HTTPException(501, "RAG not available in this image.")
     try:
         file_tuples=[]
         for f in files:
@@ -353,18 +439,20 @@ async def docs_upload(files: List[UploadFile] = File(...), _=Depends(require_api
             file_tuples.append((f.filename, b))
         res=ingest_documents(file_tuples)
         # refresh retriever
-        global retriever
-        retriever = get_retriever()
+        if "get_retriever" in globals():
+            global retriever
+            retriever = get_retriever()
         return res
     except Exception as e:
         print(f"[UPLOAD] error: {e}")
         raise HTTPException(500, "Gagal unggah/memproses dokumen")
 
 @app.delete("/v1/docs/{doc_id}")
-def docs_delete(doc_id: str, x_admin_token: str = Header(default=""), _=Depends(require_api_key)):
-    admin_token = os.getenv("ADMIN_TOKEN", "")
-    if not admin_token or x_admin_token != admin_token:
+def docs_delete(doc_id: str, x_admin_token: str = Header(default=""), _: None = Depends(verify_bearer)):
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
         raise HTTPException(401, "Unauthorized")
+    if "delete_document" not in globals():
+        raise HTTPException(501, "RAG not available in this image.")
     try:
         delete_document(doc_id)
         return {"deleted": doc_id}
