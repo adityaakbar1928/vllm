@@ -1,65 +1,39 @@
-# Dockerfile untuk Development & Production Hybrid
-
-# --- Tahap 1: Base Image ---
-# Kita tetap mulai dari base image NVIDIA yang lengkap dengan CUDA tools.
+# Backend Dockerfile
 FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
 
-# --- Metadata ---
-LABEL maintainer="Aditya Akbar"
-LABEL description="Image Dev-Prod untuk aplikasi LLM dengan console, vLLM, RAG, FastAPI."
-
-# --- Konfigurasi Lingkungan & Instalasi Tools Dasar ---
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-# Set cache directory agar berada di volume yang nanti kita mount
-ENV TRANSFORMERS_CACHE="/workspace/hf_cache"
-ENV HUGGINGFACE_HUB_CACHE="/workspace/hf_cache"
+ENV HF_HOME=/workspace/hf_cache
+ENV TRANSFORMERS_CACHE=/workspace/hf_cache
+ENV HUGGINGFACE_HUB_CACHE=/workspace/hf_cache
+ENV TORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
 
-# Install Python, Git, SSH, dan tools dasar lainnya
-RUN apt-get update && \
-    apt-get install -y \
-    python3.10 python3-pip git openssh-server sudo vim curl \
-    && apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    python3.10 python3.10-venv python3-pip git curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# --- Buat User untuk Development ---
-# Bekerja sebagai root terus menerus bukanlah praktik yang baik.
-RUN useradd -m -s /bin/bash -G sudo devuser
-# Set password untuk user 'devuser'. Ganti 'yourpassword' dengan password yang aman.
-RUN echo "devuser:jakarta321" | chpasswd
-# Konfigurasi SSH server
-RUN mkdir /var/run/sshd
-EXPOSE 22
-
-# --- Setup Lingkungan Kerja ---
 WORKDIR /app
-# Salin semua file proyek ke dalam direktori kerja
-COPY . .
+COPY requirements.txt .
+RUN python3 -m pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Berikan kepemilikan folder ke user baru kita
-RUN chown -R devuser:devuser /app
+# kode
+COPY app/ ./app/
 
-# --- Install Dependensi Python ---
-# Install dari requirements.txt yang sudah kita perbaiki
-RUN pip install --no-cache-dir --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+# workspace untuk cache model & vectorstore
+RUN mkdir -p /workspace/data /workspace/vectorstore && \
+    chown -R root:root /workspace
 
-# --- Jalankan Proses Indexing RAG ---
-# Ini akan membuat vectorstore langsung di dalam image
-RUN python3 rag_processor.py
-RUN chown -R devuser:devuser /app/vectorstore
+# default env (override di Helm/Deployment)
+ENV APP_ENV=production \
+    MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct \
+    GPU_MEM_UTIL=0.30 \
+    MAX_MODEL_LEN=8192 \
+    TEMP=0.7 TOP_P=0.95 MAX_TOKENS=1024 \
+    SHOW_TPS=true \
+    RAG_MODE=off \
+    API_KEY=jakarta321
 
-# --- Pindah ke User 'devuser' ---
-USER devuser
-WORKDIR /app
-
-# --- Port Exposure ---
-# Port untuk FastAPI, Streamlit, dan SSH
-EXPOSE 8000 8501 22
-
-# --- Perintah Default ---
-# Perintah ini akan dijalankan jika Anda 'docker run' tanpa argumen.
-# Ini menjalankan FastAPI. Anda bisa override ini untuk mendapatkan shell.
-ENV APP_ENV="production"
-CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "main:app"]
+EXPOSE 8000
+CMD ["gunicorn","-w","1","-k","uvicorn.workers.UvicornWorker","-b","0.0.0.0:8000","app.main:app"]

@@ -1,27 +1,29 @@
-# Backend & Server
+# Server
 fastapi
 uvicorn[standard]
 gunicorn
-pydantic-settings
 pydantic
+python-multipart
+pypdf
+docx2txt
 
-# LLM & Inference
+# LLM & inference
 vllm
+transformers>=4.41
+huggingface_hub
 
-# RAG & VectorDB
+# RAG
 langchain
 langchain-community
 langchain-huggingface
 sentence-transformers
 faiss-cpu
-
-# Observability
-langfuse
+pypdf
+docx2txt
 
 # Frontend
 streamlit
 
-numpy
-pandas
-scikit-learn
+# Utils
 requests
+numpy

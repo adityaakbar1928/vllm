@@ -1,0 +1,22 @@
+models:
+  - type: main
+    engine: langchain
+    parameters:
+      model: local-vllm
+
+rails:
+  input:
+    flows: [pii_check, prompt_injection_check]
+  output:
+    flows: [hallucination_check, toxicity_check]
+
+instructions:
+  general: |
+    Kamu adalah asisten yang membantu, ringkas, dan akurat. Jika konteks tidak memadai,
+    katakan tidak tahu dan sarankan langkah verifikasi.
+
+config:
+  pii: { enabled: true }
+  prompt_injection: { enabled: true }
+  toxicity: { enabled: true }
+  hallucination: { enabled: true }
