@@ -1,6 +1,6 @@
 # app/main.py
 import os, time, uuid, json, re
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Any, Literal, Union
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,11 +9,12 @@ from pydantic import BaseModel, Field
 # ===================== ENV =====================
 APP_ENV       = os.getenv("APP_ENV", "production").lower()
 MODEL_NAME    = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 GPU_MEM_UTIL  = float(os.getenv("GPU_MEM_UTIL", "0.6"))
 MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", "8192"))
-TEMP          = float(os.getenv("TEMP", "0.7"))
+TEMP          = float(os.getenv("TEMP", "0.1"))  # Lower temperature for better tool calling
 TOP_P         = float(os.getenv("TOP_P", "0.95"))
-MAX_TOKENS    = int(os.getenv("MAX_TOKENS", "512"))
+MAX_TOKENS    = int(os.getenv("MAX_TOKENS", "1024"))  # Increased for tool calls
 SHOW_TPS      = os.getenv("SHOW_TPS", "true").lower() == "true"
 API_KEY       = os.getenv("API_KEY", "jakarta321")
 ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")
@@ -21,9 +22,7 @@ HF_TOKEN      = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 RAG_MODE      = os.getenv("RAG_MODE", "off").lower()   # off | on | auto
 
 # ===================== State Management (In-Memory for Demo) =====================
-# WARNING: NOT FOR PRODUCTION. Wiped on restart. Fails with multiple replicas.
 CONVERSATION_STORE: Dict[str, List[Dict[str, Any]]] = {}
-# =================================================================================
 
 # ===================== Schemas =====================
 class ChatRequest(BaseModel):
@@ -42,9 +41,7 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
-    # BARU: LangChain terkadang mengirim 'tool_calls' di dalam pesan user/assistant
     tool_calls: Optional[List[Dict[str, Any]]] = None
-
 
 class ToolFunction(BaseModel):
     name: str
@@ -63,111 +60,143 @@ class ChatCompletionsRequest(BaseModel):
     top_p: Optional[float] = None
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Any] = None
-    # BARU: Menambahkan conversation_id untuk melacak state
     conversation_id: Optional[str] = Field(None, description="ID to track conversation history.")
+    
+class EmbeddingsRequest(BaseModel):
+    input: Union[str, List[str]]
+    model: str
 
-def _extract_first_json_obj(text: str) -> Optional[Dict[str, Any]]:
-    """Ambil JSON object pertama yang balanced dari string."""
+class EmbeddingObject(BaseModel):
+    object: str = "embedding"
+    embedding: List[float]
+    index: int
+
+class EmbeddingsResponse(BaseModel):
+    object: str = "list"
+    data: List[EmbeddingObject]
+    model: str
+
+# ===================== Improved Tool Parsing Functions =====================
+
+def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Robust JSON extraction from model output.
+    Handles markdown code blocks and plain JSON.
+    """
     if not text:
         return None
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-        else:
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start:i+1])
-                    except Exception:
-                        return None
-    return None
-
-def _canon(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-
-def _map_tool_name_to_allowed(name: str, allowed_tools: Optional[List[Dict[str, Any]]]) -> str:
-    """Cocokkan nama tool LLM ke daftar tool yang dikirim klien (n8n)."""
-    if not allowed_tools:
-        return name
-    target = _canon(name)
-    best = name
-    for t in allowed_tools:
-        if t.get("type") != "function": 
-            continue
-        fn = (t.get("function") or {}).get("name")
-        if not fn:
-            continue
-        if _canon(fn) == target:
-            return fn
-    # fallback: fuzzy sederhana (startswith)
-    for t in allowed_tools:
-        if t.get("type") != "function":
-            continue
-        fn = (t.get("function") or {}).get("name")
-        if fn and (_canon(fn).startswith(target) or target.startswith(_canon(fn))):
-            return fn
-    return name
-
-def _build_tool_calls_from_text(text: str, allowed_tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
-    """
-    Baca teks model. Jika berisi JSON dengan kunci 'tool_calls', konversi ke schema OpenAI:
-    [
-      { "id":"call_1", "type":"function", "function":{"name":"...","arguments":"{...}"} }, ...
-    ]
-    """
-    obj = _extract_first_json_obj(text)
-    if not isinstance(obj, dict):
-        return None
-    tc = obj.get("tool_calls")
-    if not isinstance(tc, list) or not tc:
-        # dukung format alternatif: {"invocations":[{"name":"...","arguments":{...}}]}
-        tc = obj.get("invocations")
-        if not isinstance(tc, list) or not tc:
+    
+    # Remove any leading/trailing whitespace
+    text = text.strip()
+    
+    # Try to find JSON in markdown code blocks first
+    json_block_pattern = r'```(?:json)?\s*(\{.*?\})\s*```'
+    match = re.search(json_block_pattern, text, re.DOTALL | re.IGNORECASE)
+    
+    if match:
+        json_str = match.group(1).strip()
+    else:
+        # Look for standalone JSON object
+        # Find the first { and try to parse a complete JSON object
+        start_idx = text.find('{')
+        if start_idx == -1:
             return None
-
-    out = []
-    for idx, item in enumerate(tc, start=1):
-        # normalisasi bentuk
-        if "function" in item and isinstance(item["function"], dict):
-            fn_name = item["function"].get("name")
-            args = item["function"].get("arguments", {})
+            
+        # Find matching closing brace
+        brace_count = 0
+        end_idx = start_idx
+        in_string = False
+        escape_next = False
+        
+        for i in range(start_idx, len(text)):
+            char = text[i]
+            
+            if escape_next:
+                escape_next = False
+                continue
+                
+            if char == '\\':
+                escape_next = True
+                continue
+                
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+                
+            if not in_string:
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i
+                        break
+        
+        if brace_count == 0:
+            json_str = text[start_idx:end_idx + 1]
         else:
-            fn_name = item.get("name")
-            args = item.get("arguments", {})
-        # pastikan args adalah string JSON sesuai OpenAI schema
-        if not isinstance(args, str):
-            try:
-                args = json.dumps(args or {})
-            except Exception:
-                args = "{}"
+            return None
+    
+    # Try to parse the extracted JSON
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
 
-        mapped_name = _map_tool_name_to_allowed(fn_name or "", allowed_tools)
-        out.append({
-            "id": f"call_{idx}",
+def build_tool_calls_from_parsed_json(parsed_json: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """
+    Convert parsed JSON to OpenAI tool calls format.
+    """
+    if not isinstance(parsed_json, dict):
+        return None
+    
+    # Check if it's already in the correct format
+    tool_calls_data = parsed_json.get("tool_calls", [])
+    
+    if not isinstance(tool_calls_data, list) or not tool_calls_data:
+        return None
+    
+    formatted_tool_calls = []
+    
+    for i, tool_call in enumerate(tool_calls_data):
+        if not isinstance(tool_call, dict):
+            continue
+            
+        if tool_call.get("type") != "function":
+            continue
+            
+        function_data = tool_call.get("function", {})
+        if not isinstance(function_data, dict):
+            continue
+            
+        function_name = function_data.get("name")
+        if not function_name:
+            continue
+            
+        # Handle arguments - ensure it's a JSON string as per OpenAI spec
+        arguments = function_data.get("arguments", {})
+        if isinstance(arguments, dict):
+            arguments_str = json.dumps(arguments)
+        elif isinstance(arguments, str):
+            # Validate it's proper JSON
+            try:
+                json.loads(arguments)
+                arguments_str = arguments
+            except:
+                arguments_str = json.dumps({})
+        else:
+            arguments_str = json.dumps({})
+        
+        formatted_tool_calls.append({
+            "id": tool_call.get("id", f"call_{uuid.uuid4().hex[:8]}"),
             "type": "function",
             "function": {
-                "name": mapped_name or (fn_name or ""),
-                "arguments": args
+                "name": function_name,
+                "arguments": arguments_str
             }
         })
-    return out or None
+    
+    return formatted_tool_calls if formatted_tool_calls else None
 
 # ===================== Tokenizer helpers =====================
 tokenizer = None
@@ -186,29 +215,50 @@ try:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True, token=HF_TOKEN)
     chat_tmpl_ok = bool(getattr(tokenizer, "chat_template", None))
 except Exception as e:
-    print(f"[Tokenizer] init error: {e} (lanjut tanpa tokenizer)")
+    print(f"[Tokenizer] init error: {e} (continuing without tokenizer)")
 
 def to_prompt_from_messages(messages: List[Dict[str,str]]) -> str:
+    """
+    Convert messages to prompt string, ensuring content is never None.
+    """
+    # Create safe messages with guaranteed string content
+    safe_messages = []
+    for m in messages:
+        msg_copy = m.copy()
+        if msg_copy.get("content") is None:
+            msg_copy["content"] = ""
+        
+        # Ensure content is always a string
+        if not isinstance(msg_copy["content"], str):
+             msg_copy["content"] = json.dumps(msg_copy["content"], ensure_ascii=False)
+
+        safe_messages.append(msg_copy)
+
+    # Use chat template if available
     if tokenizer and chat_tmpl_ok:
         try:
-            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            return tokenizer.apply_chat_template(
+                safe_messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
         except Exception as e:
-            print(f"[ChatTemplate] apply failed: {e} (fallback)")
+            print(f"[ChatTemplate] apply failed: {e} (using fallback)")
+
+    # Fallback formatting
     parts = []
-    for m in messages:
-        role = m.get("role","user")
-        content = m.get("content","")
-        # Handle pesan 'tool' yang content-nya mungkin bukan string
-        if not isinstance(content, str):
-            content = json.dumps(content, ensure_ascii=False)
-        parts.append(f"{role.upper()}: {content}")
+    for m in safe_messages:
+        role = m.get("role", "user").upper()
+        content = m.get("content", "")
+        parts.append(f"{role}: {content}")
     parts.append("ASSISTANT:")
     return "\n".join(parts)
 
-# ===================== LLM init (no lazy) =====================
+# ===================== LLM init =====================
 llm = None
 sampling_params = None
 vllm_last_error: Optional[str] = None
+embedding_model = None
 
 if APP_ENV == "local":
     class MockLLM:
@@ -218,7 +268,7 @@ if APP_ENV == "local":
                 def __init__(self, t): self.text=t
             class _R:
                 def __init__(self, t): self.outputs=[_O(t)]
-            return [_R("Ini jawaban mock. (ENV=local)")]
+            return [_R("This is a mock response. (ENV=local)")]
     llm = MockLLM()
 else:
     try:
@@ -234,131 +284,96 @@ else:
             top_p=TOP_P,
             max_tokens=MAX_TOKENS,
         )
+        from sentence_transformers import SentenceTransformer
+        print(f"[Embeddings] Loading model: {EMBEDDING_MODEL_NAME}...")
+        embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cuda')
+        print("[Embeddings] Model loaded successfully.")
     except Exception as e:
         vllm_last_error = str(e)
         print(f"[LLM] init error: {e}")
 
-# ===================== RAG (optional, non-strict) =====================
-# (Tidak ada perubahan di bagian ini)
+# ===================== RAG (optional) =====================
 retriever = None
 try:
-    from rag_processor import (
+    from app.rag_processor import (
         get_retriever, ensure_vector_db_ready,
         ingest_documents, list_documents, delete_document
     )
     ensure_vector_db_ready()
     retriever = get_retriever()
 except Exception as e:
-    print(f"[RAG] init warning: {e} (RAG tetap opsional)")
+    print(f"[RAG] init warning: {e} (RAG remains optional)")
 
-def build_messages_with_optional_context(user_prompt: str):
-    context = ""
-    if RAG_MODE in ("on", "auto") and retriever is not None:
-        try:
-            docs = retriever.invoke(user_prompt)
-            if docs:
-                context = "\n\n".join([d.page_content for d in docs])[:4000]
-        except Exception as e:
-            print(f"[RAG] retrieve err: {e}")
-    system_msg = {
-        "role": "system",
-        "content": (
-            "You are a helpful assistant. If a 'Context' section is provided and relevant, use it. "
-            "If context is missing or insufficient, answer using your general knowledge clearly. "
-            "If unsure, say you are unsure."
-        )
-    }
-    user_content = user_prompt if not context else f"Context:\n{context}\n\nQuestion:\n{user_prompt}"
-    user_msg = {"role":"user","content": user_content}
-    return [system_msg, user_msg]
-
-# ===================== Tool-calling helpers =====================
-# (Tidak ada perubahan di bagian ini)
-def _extract_json_first(s: str) -> Optional[dict]:
-    s = (s or "").strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z0-9_+-]*", "", s).strip()
-        if s.endswith("```"):
-            s = s[:-3]
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    start = s.find("{")
-    while start != -1:
-        depth = 0
-        i = start
-        while i < len(s):
-            ch = s[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    cand = s[start:i+1]
-                    try:
-                        return json.loads(cand)
-                    except Exception:
-                        break
-            i += 1
-        start = s.find("{", start+1)
-    return None
-
-def _tool_system_instructions(tools: List[ToolSpec], tool_choice: Optional[Any]) -> str:
-    tgt = None
-    if isinstance(tool_choice, dict):
-        fn = tool_choice.get("function", {})
-        tgt = fn.get("name")
-    lines = [
-        "TOOLS AVAILABLE:",
-        json.dumps({"tools":[t.model_dump() for t in tools]}, ensure_ascii=False),
-        "",
-        "If tools are provided:",
-        '- If you decide to call tool(s), output ONLY a single JSON object of the form:',
-        '  {"tool_calls":[{"type":"function","function":{"name":"<tool_name>","arguments":{...}}}, ...]}',
-        '- If no tool is needed, output ONLY: {"final":true,"content":"<your answer>"}',
-        "Do NOT add backticks. Do NOT add explanations outside JSON.",
-    ]
-    if tgt:
-        lines.append(f'Prefer calling function name "{tgt}" when appropriate.')
-    return "\n".join(lines)
-
-def _maybe_wrap_toolcall_response(text: str):
-    """Parse teks model → (tool_calls or final content)."""
-    data = _extract_json_first(text)
-    if isinstance(data, dict):
-        # tool_calls path
-        if "tool_calls" in data and isinstance(data["tool_calls"], list) and data["tool_calls"]:
-            tool_calls = []
-            for _tc in data["tool_calls"]:
-                if not isinstance(_tc, dict): continue
-                if _tc.get("type") != "function": continue
-                fn = _tc.get("function", {})
-                name = fn.get("name") or ""
-                
-                # --- PERUBAHAN DI SINI ---
-                # Ambil argumen
-                args = fn.get("arguments")
-                
-                # Pastikan argumen adalah dict, bukan string. JANGAN di-dumps.
-                if not isinstance(args, dict):
-                    args = {} # Jika format salah, default ke objek kosong
-
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:12]}",
-                    "type": "function",
-                    "function": {"name": name, "arguments": args} # 'args' sekarang adalah dict
+# ===================== Improved Tool System Instructions =====================
+def create_tool_system_prompt(tools: List[Dict[str, Any]], tool_choice: Optional[Any] = None) -> str:
+    """
+    Create optimized system prompt for tool calling.
+    Specifically optimized for N8N Qdrant retriever compatibility.
+    """
+    if not tools:
+        return ""
+    
+    # Format tools for the model with N8N-specific parameter naming
+    formatted_tools = []
+    for tool in tools:
+        if tool.get("type") == "function":
+            func_info = tool.get("function", {})
+            tool_name = func_info.get("name", "")
+            
+            # Special handling for retriever tool to match N8N expectations
+            if tool_name == "retriever":
+                formatted_tools.append({
+                    "name": "retriever",
+                    "description": func_info.get("description", "Retrieve relevant information from the knowledge base"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query to find relevant information"
+                            }
+                        },
+                        "required": ["query"]
+                    }
                 })
-            if tool_calls:
-                return {"tool_calls": tool_calls}
-        # final content path
-        if data.get("final") is True and isinstance(data.get("content"), str):
-            return {"final": data["content"]}
-    # fallback → treat as normal answer
-    return {"final": text}
+            else:
+                formatted_tools.append({
+                    "name": func_info.get("name"),
+                    "description": func_info.get("description", ""),
+                    "parameters": func_info.get("parameters", {})
+                })
+    
+    system_prompt = f"""You have access to the following tools:
 
-# ===================== Auth (Bearer) =====================
-# (Tidak ada perubahan di bagian ini)
+{json.dumps(formatted_tools, indent=2)}
+
+IMPORTANT INSTRUCTIONS FOR TOOL USAGE:
+1. When you need to use a tool, respond with ONLY a JSON object in this exact format:
+{{"tool_calls": [{{"type": "function", "function": {{"name": "tool_name", "arguments": {{"query": "search terms"}}}}}}]}}
+
+2. For the retriever tool, ALWAYS use "query" as the parameter name (not "input").
+
+3. When you don't need to use any tools, respond normally with your answer.
+
+4. Always provide meaningful search terms in the query parameter.
+
+5. Do not add any explanation or text outside the JSON when making tool calls.
+
+6. Make sure your JSON is valid and properly formatted.
+
+Examples:
+- To search for information: {{"tool_calls": [{{"type": "function", "function": {{"name": "retriever", "arguments": {{"query": "your search terms"}}}}}}]}}
+- For normal chat: Just respond with regular text."""
+
+    # Handle specific tool choice
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        preferred_tool = tool_choice.get("function", {}).get("name")
+        if preferred_tool:
+            system_prompt += f"\n\n7. Prefer using the '{preferred_tool}' tool when appropriate."
+
+    return system_prompt
+
+# ===================== Auth =====================
 def verify_bearer(req: Request):
     auth = req.headers.get("authorization", "")
     if not auth.startswith("Bearer "):
@@ -368,7 +383,7 @@ def verify_bearer(req: Request):
         raise HTTPException(401, "Invalid API key")
 
 # ===================== FastAPI app =====================
-app = FastAPI(title="General LLM API (OpenAI-compatible, Tools, optional RAG)", version="1.2.0-stateful")
+app = FastAPI(title="General LLM API (OpenAI-compatible, Tools, optional RAG)", version="1.3.0-improved-tools")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -388,89 +403,112 @@ def health():
         "active_conversations": len(CONVERSATION_STORE)
     }
 
-# ---------------- /v1/models ----------------
-# (Tidak ada perubahan di bagian ini)
+# ===================== Models endpoint =====================
 @app.get("/v1/models")
 def list_models(_: None = Depends(verify_bearer)):
-    return {
-        "object": "list",
-        "data": [{
-            "id": MODEL_NAME, "object": "model", "owned_by": "local", "created": int(time.time()),
-        }]
-    }
+    model_data = [
+        {
+            "id": MODEL_NAME,
+            "object": "model",
+            "owned_by": "local",
+            "created": int(time.time())
+        }
+    ]
+    
+    if embedding_model is not None:
+        model_data.append({
+            "id": EMBEDDING_MODEL_NAME,
+            "object": "model",
+            "owned_by": "local",
+            "created": int(time.time())
+        })
 
-# ---------------- Simple chat ----------------
-# (Tidak ada perubahan di bagian ini)
+    return {"object": "list", "data": model_data}
+
+# ===================== Simple chat =====================
 @app.post("/v1/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, _: None = Depends(verify_bearer)):
-    if llm is None: raise HTTPException(503, "LLM not available.")
-    messages = build_messages_with_optional_context(req.prompt)
+async def chat(req: ChatCompletionsRequest, _: None = Depends(verify_bearer)):
+    if llm is None: 
+        raise HTTPException(503, "LLM not available.")
+    
+    messages = [m.model_dump(exclude_none=True) for m in req.messages]
     prompt = to_prompt_from_messages(messages)
-    t0=time.perf_counter()
+    
+    t0 = time.perf_counter()
     try:
         out = llm.generate(prompt, sampling_params)
         text = out[0].outputs[0].text
     except Exception as e:
         print(f"[LLM] error: {e}")
         raise HTTPException(500, "Inference error.")
+    
     dt = max(1e-6, time.perf_counter()-t0)
-    toks_in  = count_tokens(prompt); toks_out = count_tokens(text)
-    metrics = {"latency_sec": round(dt,3), "tokens_in": toks_in,
-               "tokens_out": toks_out, "tok_per_sec": round(toks_out/dt,2)} if SHOW_TPS else None
+    toks_in = count_tokens(prompt)
+    toks_out = count_tokens(text)
+    metrics = {
+        "latency_sec": round(dt,3), 
+        "tokens_in": toks_in,
+        "tokens_out": toks_out, 
+        "tok_per_sec": round(toks_out/dt,2)
+    } if SHOW_TPS else None
+    
+    # Clean output from prompt bleeding
+    text = re.split(r"\n(USER|ASSISTANT|SYSTEM):", text, 1)[0].strip()
     return ChatResponse(response=text, metrics=metrics)
 
-# ---------------- OpenAI-compatible chat/completions (DIROMBAK TOTAL) ----------------
+# ===================== Main chat/completions endpoint =====================
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionsRequest):
-    if llm is None:
+async def chat_completions(req: ChatCompletionsRequest, auth: None = Depends(verify_bearer)):
+    if llm is None: 
         raise HTTPException(503, "LLM not available.")
 
-    # Base system
-    base_sys = {
-        "role":"system",
-        "content":"You are a helpful assistant. Prefer context if provided. If absent, answer with general knowledge."
-    }
-    messages = [base_sys] + [m.model_dump() for m in req.messages]
+    # Prepare messages
+    messages = [m.model_dump(exclude_none=True) for m in req.messages]
+    
+    # Add tool system prompt if tools are provided
+    if req.tools:
+        tool_system_prompt = create_tool_system_prompt(req.tools, req.tool_choice)
+        
+        # Insert or update system message
+        system_message_found = False
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                # Append tool instructions to existing system message
+                messages[i]["content"] = f"{msg.get('content', '')}\n\n{tool_system_prompt}".strip()
+                system_message_found = True
+                break
+        
+        if not system_message_found:
+            # Add new system message at the beginning
+            messages.insert(0, {"role": "system", "content": tool_system_prompt})
 
-    # Optional RAG context (non-strict)
-    try:
-        last_user = next((m["content"] for m in reversed(messages) if m["role"]=="user"), "")
-        if RAG_MODE in ("on","auto") and retriever is not None and last_user:
-            docs = retriever.invoke(last_user)
-            if docs:
-                ctx = "\n\n".join([d.page_content for d in docs])[:4000]
-                messages.append({"role":"system","content": f"Context:\n{ctx}"})
-    except Exception as e:
-        print(f"[RAG] optional ctx error: {e}")
-
-    # Jika tools ada & tool_choice != "none", paksa format JSON tool_calls
-    tool_mode = bool(req.tools) and (req.tool_choice != "none")
-    if tool_mode:
-        tool_lines = []
-        for t in (req.tools or []):
-            if t.get("type") == "function" and t.get("function"):
-                fn = t["function"]
-                nm = fn.get("name","")
-                desc = fn.get("description","")
-                tool_lines.append(f"- {nm}: {desc}")
-        tools_block = "\n".join(tool_lines) if tool_lines else "(no tool descriptions)"
-
-        guidance = {
-            "role":"system",
-            "content":(
-                "You may call ONE function if useful. "
-                "Return ONLY a JSON object with this shape and NOTHING else:\n"
-                "{\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"<one of allowed>\",\"arguments\":{...}}}]}\n"
-                "Allowed tools:\n" + tools_block
+    # Optional RAG context
+    if RAG_MODE in ("on", "auto") and retriever:
+        try:
+            last_user_msg = next(
+                (m["content"] for m in reversed(messages) 
+                 if m["role"] == "user" and m.get("content")), 
+                ""
             )
-        }
-        messages = messages + [guidance]
+            if last_user_msg:
+                docs = retriever.invoke(last_user_msg)
+                if docs:
+                    context = "\n\n".join([d.page_content for d in docs])[:4000]
+                    context_msg = {
+                        "role": "system", 
+                        "content": f"## Relevant Context:\n{context}"
+                    }
+                    # Insert context before the last user message
+                    messages.insert(-1, context_msg)
+        except Exception as e:
+            print(f"[RAG] context retrieval error: {e}")
 
+    # Convert to prompt
     prompt = to_prompt_from_messages(messages)
-
-    # Sampling params override (opsional)
+    
+    # Setup sampling parameters
     sp = sampling_params
-    if req.max_tokens or req.temperature or req.top_p:
+    if any([req.max_tokens, req.temperature, req.top_p]):
         from vllm import SamplingParams
         sp = SamplingParams(
             temperature=req.temperature if req.temperature is not None else TEMP,
@@ -478,53 +516,71 @@ async def chat_completions(req: ChatCompletionsRequest):
             max_tokens=req.max_tokens if req.max_tokens is not None else MAX_TOKENS,
         )
 
-    # Generate
-    t0=time.perf_counter()
+    # Generate response
+    t0 = time.perf_counter()
     try:
         out = llm.generate(prompt, sp)
         text = out[0].outputs[0].text
     except Exception as e:
-        print(f"[LLM] error: {e}")
-        raise HTTPException(500, "Inference error.")
+        print(f"[LLM] generate error: {e}")
+        raise HTTPException(500, f"Inference error: {e}")
+    
+    dt = max(1e-6, time.perf_counter() - t0)
 
-    dt = max(1e-6, time.perf_counter()-t0)
-    toks_in  = count_tokens(prompt)
-    toks_out = count_tokens(text)
-
-    # === Tool-calls bridging ===
-    tool_calls_block = None
-    if tool_mode:
-        tool_calls_block = _build_tool_calls_from_text(text, req.tools)
-
-    if tool_calls_block:
-        # n8n butuh content string (bukan null) saat ada tool_calls
-        message_obj = {"role":"assistant","content":"", "tool_calls": tool_calls_block}
-        finish = "tool_calls"
+    # Parse response for tool calls
+    message_obj = {"role": "assistant"}
+    finish_reason = "stop"
+    
+    if req.tools:
+        # Try to extract tool calls
+        parsed_json = extract_json_from_text(text)
+        if parsed_json:
+            tool_calls = build_tool_calls_from_parsed_json(parsed_json)
+            if tool_calls:
+                message_obj["tool_calls"] = tool_calls
+                message_obj["content"] = None  # OpenAI standard for tool calls
+                finish_reason = "tool_calls"
+            else:
+                # Not a tool call, treat as regular response
+                clean_text = re.split(r"\n(USER|ASSISTANT|SYSTEM):", text, 1)[0].strip()
+                message_obj["content"] = clean_text or "I apologize, but I couldn't generate a proper response."
+        else:
+            # No JSON found, treat as regular response
+            clean_text = re.split(r"\n(USER|ASSISTANT|SYSTEM):", text, 1)[0].strip()
+            message_obj["content"] = clean_text or "I apologize, but I couldn't generate a proper response."
     else:
-        message_obj = {"role":"assistant","content": text or ""}
-        finish = "stop"
+        # No tools available, regular chat response
+        clean_text = re.split(r"\n(USER|ASSISTANT|SYSTEM):", text, 1)[0].strip()
+        message_obj["content"] = clean_text or "I apologize, but I couldn't generate a proper response."
 
+    # Prepare response
+    toks_in, toks_out = count_tokens(prompt), count_tokens(text)
     resp = {
-        "id": f"chatcmpl-{uuid.uuid4()}",
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": req.model or MODEL_NAME,
         "choices": [{
-            "index": 0,
-            "message": message_obj,
-            "finish_reason": finish
+            "index": 0, 
+            "message": message_obj, 
+            "finish_reason": finish_reason
         }],
         "usage": {
-            "prompt_tokens": toks_in,
-            "completion_tokens": toks_out,
+            "prompt_tokens": toks_in, 
+            "completion_tokens": toks_out, 
             "total_tokens": toks_in + toks_out
         }
     }
-    if SHOW_TPS:
-        resp["metrics"] = {"latency_sec": round(dt,3), "tps_out": round(toks_out/dt,2)}
+    
+    if SHOW_TPS: 
+        resp["metrics"] = {
+            "latency_sec": round(dt, 3), 
+            "tps_out": round(toks_out/dt, 2)
+        }
+    
     return resp
 
-# ---------------- Endpoint baru untuk membersihkan state ----------------
+# ===================== Conversation management =====================
 @app.delete("/v1/conversations/{conv_id}")
 def delete_conversation(conv_id: str, _: None = Depends(verify_bearer)):
     if conv_id in CONVERSATION_STORE:
@@ -533,46 +589,88 @@ def delete_conversation(conv_id: str, _: None = Depends(verify_bearer)):
     else:
         raise HTTPException(404, f"Conversation ID '{conv_id}' not found.")
 
+# ===================== Embeddings endpoint =====================
+@app.post("/v1/embeddings", response_model=EmbeddingsResponse)
+async def create_embeddings(req: EmbeddingsRequest, auth: None = Depends(verify_bearer)):
+    if embedding_model is None:
+        raise HTTPException(status_code=503, detail="Embedding model not available.")
 
-# ---------------- Sisa endpoint (Bench & RAG) tidak berubah ----------------
+    if isinstance(req.input, str):
+        inputs = [req.input]
+    else:
+        inputs = req.input
+
+    try:
+        vectors = embedding_model.encode(inputs, normalize_embeddings=True).tolist()
+        response_data = [
+            EmbeddingObject(embedding=vec, index=i) for i, vec in enumerate(vectors)
+        ]
+        return EmbeddingsResponse(data=response_data, model=EMBEDDING_MODEL_NAME)
+    except Exception as e:
+        print(f"[Embeddings] Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create embeddings.")
+
+# ===================== Remaining endpoints (Bench & RAG) =====================
 @app.post("/v1/bench")
 def bench(req: BenchRequest, _: None = Depends(verify_bearer)):
-    if llm is None: raise HTTPException(503, "LLM not available.")
-    tms=[]
+    if llm is None: 
+        raise HTTPException(503, "LLM not available.")
+    
+    times = []
     for p in req.prompts:
-        messages = build_messages_with_optional_context(p)
+        messages = [{"role": "user", "content": p}]
         prompt = to_prompt_from_messages(messages)
-        t0=time.perf_counter(); _=llm.generate(prompt, sampling_params)
-        tms.append(time.perf_counter()-t0)
-    tms_s=sorted(tms); n=len(tms)
+        t0 = time.perf_counter()
+        _ = llm.generate(prompt, sampling_params)
+        times.append(time.perf_counter() - t0)
+    
+    times_sorted = sorted(times)
+    n = len(times)
     return {
         "count": n,
-        "latency": {"avg_sec": sum(tms)/n, "p50_sec": tms_s[n//2], "p90_sec": tms_s[max(0, int(0.9*n)-1)]},
-        "model": MODEL_NAME, "max_tokens_param": MAX_TOKENS
+        "latency": {
+            "avg_sec": sum(times)/n, 
+            "p50_sec": times_sorted[n//2], 
+            "p90_sec": times_sorted[max(0, int(0.9*n)-1)]
+        },
+        "model": MODEL_NAME, 
+        "max_tokens_param": MAX_TOKENS
     }
 
 @app.get("/v1/docs")
 def docs_list(_: None = Depends(verify_bearer)):
-    if "list_documents" not in globals(): return {"items": []}
-    try: return {"items": list_documents()}
-    except Exception as e: raise HTTPException(500, f"Gagal baca daftar dokumen: {e}")
+    if "list_documents" not in globals(): 
+        return {"items": []}
+    try: 
+        return {"items": list_documents()}
+    except Exception as e: 
+        raise HTTPException(500, f"Failed to read document list: {e}")
 
 @app.post("/v1/docs/upload")
 async def docs_upload(files: List[UploadFile] = File(...), _: None = Depends(verify_bearer)):
-    if "ingest_documents" not in globals(): raise HTTPException(501, "RAG not available in this image.")
+    if "ingest_documents" not in globals(): 
+        raise HTTPException(501, "RAG not available in this image.")
     try:
-        file_tuples=[]
+        file_tuples = []
         for f in files:
-            b=await f.read(); file_tuples.append((f.name, b))
-        res=ingest_documents(file_tuples)
-        global retriever; retriever = get_retriever()
+            b = await f.read()
+            file_tuples.append((f.name, b))
+        res = ingest_documents(file_tuples)
+        global retriever
+        retriever = get_retriever()
         return res
-    except Exception as e: print(f"[UPLOAD] error: {e}"); raise HTTPException(500, "Gagal unggah/memproses dokumen")
+    except Exception as e: 
+        print(f"[UPLOAD] error: {e}")
+        raise HTTPException(500, "Failed to upload/process documents")
 
 @app.delete("/v1/docs/{doc_id}")
 def docs_delete(doc_id: str, x_admin_token: str = Header(default=""), _: None = Depends(verify_bearer)):
-    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN: raise HTTPException(401, "Unauthorized")
-    if "delete_document" not in globals(): raise HTTPException(501, "RAG not available in this image.")
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN: 
+        raise HTTPException(401, "Unauthorized")
+    if "delete_document" not in globals(): 
+        raise HTTPException(501, "RAG not available in this image.")
     try:
-        delete_document(doc_id); return {"deleted": doc_id}
-    except Exception as e: raise HTTPException(500, f"Gagal hapus dokumen: {e}")
+        delete_document(doc_id)
+        return {"deleted": doc_id}
+    except Exception as e: 
+        raise HTTPException(500, f"Failed to delete document: {e}")
