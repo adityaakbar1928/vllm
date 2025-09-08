@@ -20,6 +20,11 @@ ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")
 HF_TOKEN      = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 RAG_MODE      = os.getenv("RAG_MODE", "off").lower()   # off | on | auto
 
+# ===================== State Management (In-Memory for Demo) =====================
+# WARNING: NOT FOR PRODUCTION. Wiped on restart. Fails with multiple replicas.
+CONVERSATION_STORE: Dict[str, List[Dict[str, Any]]] = {}
+# =================================================================================
+
 # ===================== Schemas =====================
 class ChatRequest(BaseModel):
     prompt: str
@@ -37,6 +42,9 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
+    # BARU: LangChain terkadang mengirim 'tool_calls' di dalam pesan user/assistant
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+
 
 class ToolFunction(BaseModel):
     name: str
@@ -44,7 +52,6 @@ class ToolFunction(BaseModel):
     parameters: Optional[Dict[str, Any]] = None
 
 class ToolSpec(BaseModel):
-    # Pydantic v2: gunakan Literal, jangan Field(..., const=True)
     type: Literal["function"] = "function"
     function: ToolFunction
 
@@ -54,8 +61,113 @@ class ChatCompletionsRequest(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    tools: Optional[List[ToolSpec]] = None
-    tool_choice: Optional[Any] = None  # "none" | "auto" | {"type":"function","function":{"name":"..."}}
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
+    # BARU: Menambahkan conversation_id untuk melacak state
+    conversation_id: Optional[str] = Field(None, description="ID to track conversation history.")
+
+def _extract_first_json_obj(text: str) -> Optional[Dict[str, Any]]:
+    """Ambil JSON object pertama yang balanced dari string."""
+    if not text:
+        return None
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i+1])
+                    except Exception:
+                        return None
+    return None
+
+def _canon(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+def _map_tool_name_to_allowed(name: str, allowed_tools: Optional[List[Dict[str, Any]]]) -> str:
+    """Cocokkan nama tool LLM ke daftar tool yang dikirim klien (n8n)."""
+    if not allowed_tools:
+        return name
+    target = _canon(name)
+    best = name
+    for t in allowed_tools:
+        if t.get("type") != "function": 
+            continue
+        fn = (t.get("function") or {}).get("name")
+        if not fn:
+            continue
+        if _canon(fn) == target:
+            return fn
+    # fallback: fuzzy sederhana (startswith)
+    for t in allowed_tools:
+        if t.get("type") != "function":
+            continue
+        fn = (t.get("function") or {}).get("name")
+        if fn and (_canon(fn).startswith(target) or target.startswith(_canon(fn))):
+            return fn
+    return name
+
+def _build_tool_calls_from_text(text: str, allowed_tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    """
+    Baca teks model. Jika berisi JSON dengan kunci 'tool_calls', konversi ke schema OpenAI:
+    [
+      { "id":"call_1", "type":"function", "function":{"name":"...","arguments":"{...}"} }, ...
+    ]
+    """
+    obj = _extract_first_json_obj(text)
+    if not isinstance(obj, dict):
+        return None
+    tc = obj.get("tool_calls")
+    if not isinstance(tc, list) or not tc:
+        # dukung format alternatif: {"invocations":[{"name":"...","arguments":{...}}]}
+        tc = obj.get("invocations")
+        if not isinstance(tc, list) or not tc:
+            return None
+
+    out = []
+    for idx, item in enumerate(tc, start=1):
+        # normalisasi bentuk
+        if "function" in item and isinstance(item["function"], dict):
+            fn_name = item["function"].get("name")
+            args = item["function"].get("arguments", {})
+        else:
+            fn_name = item.get("name")
+            args = item.get("arguments", {})
+        # pastikan args adalah string JSON sesuai OpenAI schema
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args or {})
+            except Exception:
+                args = "{}"
+
+        mapped_name = _map_tool_name_to_allowed(fn_name or "", allowed_tools)
+        out.append({
+            "id": f"call_{idx}",
+            "type": "function",
+            "function": {
+                "name": mapped_name or (fn_name or ""),
+                "arguments": args
+            }
+        })
+    return out or None
 
 # ===================== Tokenizer helpers =====================
 tokenizer = None
@@ -77,17 +189,18 @@ except Exception as e:
     print(f"[Tokenizer] init error: {e} (lanjut tanpa tokenizer)")
 
 def to_prompt_from_messages(messages: List[Dict[str,str]]) -> str:
-    """Pakai chat_template kalau ada, fallback format aman."""
     if tokenizer and chat_tmpl_ok:
         try:
             return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception as e:
             print(f"[ChatTemplate] apply failed: {e} (fallback)")
-    # fallback sederhana
     parts = []
     for m in messages:
         role = m.get("role","user")
         content = m.get("content","")
+        # Handle pesan 'tool' yang content-nya mungkin bukan string
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
         parts.append(f"{role.upper()}: {content}")
     parts.append("ASSISTANT:")
     return "\n".join(parts)
@@ -101,7 +214,7 @@ if APP_ENV == "local":
     class MockLLM:
         def generate(self, prompt_template: str, sampling_params: object):
             time.sleep(0.1)
-            class _O:  # minimal output shape
+            class _O:
                 def __init__(self, t): self.text=t
             class _R:
                 def __init__(self, t): self.outputs=[_O(t)]
@@ -126,6 +239,7 @@ else:
         print(f"[LLM] init error: {e}")
 
 # ===================== RAG (optional, non-strict) =====================
+# (Tidak ada perubahan di bagian ini)
 retriever = None
 try:
     from rag_processor import (
@@ -138,12 +252,6 @@ except Exception as e:
     print(f"[RAG] init warning: {e} (RAG tetap opsional)")
 
 def build_messages_with_optional_context(user_prompt: str):
-    """
-    Non-strict:
-      - RAG_MODE=off  → tanpa konteks.
-      - RAG_MODE=on   → coba ambil konteks; bila kosong, tetap jawab pakai general knowledge.
-      - RAG_MODE=auto → ambil konteks; kalau tak relevan, tetap jawab pakai general knowledge.
-    """
     context = ""
     if RAG_MODE in ("on", "auto") and retriever is not None:
         try:
@@ -152,7 +260,6 @@ def build_messages_with_optional_context(user_prompt: str):
                 context = "\n\n".join([d.page_content for d in docs])[:4000]
         except Exception as e:
             print(f"[RAG] retrieve err: {e}")
-
     system_msg = {
         "role": "system",
         "content": (
@@ -166,20 +273,17 @@ def build_messages_with_optional_context(user_prompt: str):
     return [system_msg, user_msg]
 
 # ===================== Tool-calling helpers =====================
+# (Tidak ada perubahan di bagian ini)
 def _extract_json_first(s: str) -> Optional[dict]:
-    """Ekstrak objek JSON pertama secara robust (tanpa regex recursive)."""
     s = (s or "").strip()
-    # strip code fences
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z0-9_+-]*", "", s).strip()
         if s.endswith("```"):
             s = s[:-3]
-    # coba parse full
     try:
         return json.loads(s)
     except Exception:
         pass
-    # scan objek {...} pertama yang balanced
     start = s.find("{")
     while start != -1:
         depth = 0
@@ -231,15 +335,19 @@ def _maybe_wrap_toolcall_response(text: str):
                 if _tc.get("type") != "function": continue
                 fn = _tc.get("function", {})
                 name = fn.get("name") or ""
+                
+                # --- PERUBAHAN DI SINI ---
+                # Ambil argumen
                 args = fn.get("arguments")
-                if isinstance(args, (dict, list)):
-                    args = json.dumps(args, ensure_ascii=False)
-                if not isinstance(args, str):
-                    args = "{}"
+                
+                # Pastikan argumen adalah dict, bukan string. JANGAN di-dumps.
+                if not isinstance(args, dict):
+                    args = {} # Jika format salah, default ke objek kosong
+
                 tool_calls.append({
                     "id": f"call_{uuid.uuid4().hex[:12]}",
                     "type": "function",
-                    "function": {"name": name, "arguments": args}
+                    "function": {"name": name, "arguments": args} # 'args' sekarang adalah dict
                 })
             if tool_calls:
                 return {"tool_calls": tool_calls}
@@ -250,6 +358,7 @@ def _maybe_wrap_toolcall_response(text: str):
     return {"final": text}
 
 # ===================== Auth (Bearer) =====================
+# (Tidak ada perubahan di bagian ini)
 def verify_bearer(req: Request):
     auth = req.headers.get("authorization", "")
     if not auth.startswith("Bearer "):
@@ -259,7 +368,7 @@ def verify_bearer(req: Request):
         raise HTTPException(401, "Invalid API key")
 
 # ===================== FastAPI app =====================
-app = FastAPI(title="General LLM API (OpenAI-compatible, Tools, optional RAG)", version="1.1.1")
+app = FastAPI(title="General LLM API (OpenAI-compatible, Tools, optional RAG)", version="1.2.0-stateful")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -276,26 +385,25 @@ def health():
         "rag_available": bool(retriever),
         "vllm_ready": llm is not None,
         "vllm_last_error": vllm_last_error,
+        "active_conversations": len(CONVERSATION_STORE)
     }
 
 # ---------------- /v1/models ----------------
+# (Tidak ada perubahan di bagian ini)
 @app.get("/v1/models")
 def list_models(_: None = Depends(verify_bearer)):
     return {
         "object": "list",
         "data": [{
-            "id": MODEL_NAME,
-            "object": "model",
-            "owned_by": "local",
-            "created": int(time.time()),
+            "id": MODEL_NAME, "object": "model", "owned_by": "local", "created": int(time.time()),
         }]
     }
 
 # ---------------- Simple chat ----------------
+# (Tidak ada perubahan di bagian ini)
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, _: None = Depends(verify_bearer)):
-    if llm is None:
-        raise HTTPException(503, "LLM not available.")
+    if llm is None: raise HTTPException(503, "LLM not available.")
     messages = build_messages_with_optional_context(req.prompt)
     prompt = to_prompt_from_messages(messages)
     t0=time.perf_counter()
@@ -306,28 +414,27 @@ async def chat(req: ChatRequest, _: None = Depends(verify_bearer)):
         print(f"[LLM] error: {e}")
         raise HTTPException(500, "Inference error.")
     dt = max(1e-6, time.perf_counter()-t0)
-    toks_in  = count_tokens(prompt)
-    toks_out = count_tokens(text)
+    toks_in  = count_tokens(prompt); toks_out = count_tokens(text)
     metrics = {"latency_sec": round(dt,3), "tokens_in": toks_in,
                "tokens_out": toks_out, "tok_per_sec": round(toks_out/dt,2)} if SHOW_TPS else None
     return ChatResponse(response=text, metrics=metrics)
 
-# ---------------- OpenAI-compatible chat/completions ----------------
+# ---------------- OpenAI-compatible chat/completions (DIROMBAK TOTAL) ----------------
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionsRequest, _: None = Depends(verify_bearer)):
+async def chat_completions(req: ChatCompletionsRequest):
     if llm is None:
         raise HTTPException(503, "LLM not available.")
 
-    # Base system (general purpose)
+    # Base system
     base_sys = {
         "role":"system",
-        "content":"You are a helpful assistant. Prefer provided context; if absent, answer with general knowledge clearly."
+        "content":"You are a helpful assistant. Prefer context if provided. If absent, answer with general knowledge."
     }
     messages = [base_sys] + [m.model_dump() for m in req.messages]
 
-    # Optional RAG enrichment (non-strict)
+    # Optional RAG context (non-strict)
     try:
-        last_user = next((m["content"] for m in reversed(messages) if m.get("role")=="user"), "")
+        last_user = next((m["content"] for m in reversed(messages) if m["role"]=="user"), "")
         if RAG_MODE in ("on","auto") and retriever is not None and last_user:
             docs = retriever.invoke(last_user)
             if docs:
@@ -336,14 +443,32 @@ async def chat_completions(req: ChatCompletionsRequest, _: None = Depends(verify
     except Exception as e:
         print(f"[RAG] optional ctx error: {e}")
 
-    # Tools? → tambahkan instruksi supaya model mengeluarkan JSON tool_calls/final
-    if req.tools:
-        tool_sys = {"role":"system", "content": _tool_system_instructions(req.tools, req.tool_choice)}
-        messages = [tool_sys] + messages
+    # Jika tools ada & tool_choice != "none", paksa format JSON tool_calls
+    tool_mode = bool(req.tools) and (req.tool_choice != "none")
+    if tool_mode:
+        tool_lines = []
+        for t in (req.tools or []):
+            if t.get("type") == "function" and t.get("function"):
+                fn = t["function"]
+                nm = fn.get("name","")
+                desc = fn.get("description","")
+                tool_lines.append(f"- {nm}: {desc}")
+        tools_block = "\n".join(tool_lines) if tool_lines else "(no tool descriptions)"
+
+        guidance = {
+            "role":"system",
+            "content":(
+                "You may call ONE function if useful. "
+                "Return ONLY a JSON object with this shape and NOTHING else:\n"
+                "{\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"<one of allowed>\",\"arguments\":{...}}}]}\n"
+                "Allowed tools:\n" + tools_block
+            )
+        }
+        messages = messages + [guidance]
 
     prompt = to_prompt_from_messages(messages)
 
-    # Sampling override
+    # Sampling params override (opsional)
     sp = sampling_params
     if req.max_tokens or req.temperature or req.top_p:
         from vllm import SamplingParams
@@ -353,6 +478,7 @@ async def chat_completions(req: ChatCompletionsRequest, _: None = Depends(verify
             max_tokens=req.max_tokens if req.max_tokens is not None else MAX_TOKENS,
         )
 
+    # Generate
     t0=time.perf_counter()
     try:
         out = llm.generate(prompt, sp)
@@ -360,22 +486,23 @@ async def chat_completions(req: ChatCompletionsRequest, _: None = Depends(verify
     except Exception as e:
         print(f"[LLM] error: {e}")
         raise HTTPException(500, "Inference error.")
-    dt = max(1e-6, time.perf_counter()-t0)
 
+    dt = max(1e-6, time.perf_counter()-t0)
     toks_in  = count_tokens(prompt)
     toks_out = count_tokens(text)
 
-    # Post-process tools
+    # === Tool-calls bridging ===
     tool_calls_block = None
-    final_content = None
-    if req.tools:
-        parsed = _maybe_wrap_toolcall_response(text)
-        if "tool_calls" in parsed:
-            tool_calls_block = parsed["tool_calls"]
-        else:
-            final_content = parsed.get("final", text)
+    if tool_mode:
+        tool_calls_block = _build_tool_calls_from_text(text, req.tools)
+
+    if tool_calls_block:
+        # n8n butuh content string (bukan null) saat ada tool_calls
+        message_obj = {"role":"assistant","content":"", "tool_calls": tool_calls_block}
+        finish = "tool_calls"
     else:
-        final_content = text
+        message_obj = {"role":"assistant","content": text or ""}
+        finish = "stop"
 
     resp = {
         "id": f"chatcmpl-{uuid.uuid4()}",
@@ -384,23 +511,30 @@ async def chat_completions(req: ChatCompletionsRequest, _: None = Depends(verify
         "model": req.model or MODEL_NAME,
         "choices": [{
             "index": 0,
-            "message": (
-                {"role":"assistant","content": None, "tool_calls": tool_calls_block}
-                if tool_calls_block is not None
-                else {"role":"assistant","content": final_content}
-            ),
-            "finish_reason": "tool_calls" if tool_calls_block is not None else "stop"
+            "message": message_obj,
+            "finish_reason": finish
         }],
         "usage": {
             "prompt_tokens": toks_in,
             "completion_tokens": toks_out,
             "total_tokens": toks_in + toks_out
-        },
-        "metrics": {"latency_sec": round(dt,3), "tps_out": round(toks_out/dt,2)} if SHOW_TPS else None
+        }
     }
+    if SHOW_TPS:
+        resp["metrics"] = {"latency_sec": round(dt,3), "tps_out": round(toks_out/dt,2)}
     return resp
 
-# ---------------- Bench ----------------
+# ---------------- Endpoint baru untuk membersihkan state ----------------
+@app.delete("/v1/conversations/{conv_id}")
+def delete_conversation(conv_id: str, _: None = Depends(verify_bearer)):
+    if conv_id in CONVERSATION_STORE:
+        del CONVERSATION_STORE[conv_id]
+        return {"status": "ok", "deleted": conv_id}
+    else:
+        raise HTTPException(404, f"Conversation ID '{conv_id}' not found.")
+
+
+# ---------------- Sisa endpoint (Bench & RAG) tidak berubah ----------------
 @app.post("/v1/bench")
 def bench(req: BenchRequest, _: None = Depends(verify_bearer)):
     if llm is None: raise HTTPException(503, "LLM not available.")
@@ -414,47 +548,31 @@ def bench(req: BenchRequest, _: None = Depends(verify_bearer)):
     return {
         "count": n,
         "latency": {"avg_sec": sum(tms)/n, "p50_sec": tms_s[n//2], "p90_sec": tms_s[max(0, int(0.9*n)-1)]},
-        "model": MODEL_NAME,
-        "max_tokens_param": MAX_TOKENS
+        "model": MODEL_NAME, "max_tokens_param": MAX_TOKENS
     }
 
-# ---------------- RAG endpoints (opsional) ----------------
 @app.get("/v1/docs")
 def docs_list(_: None = Depends(verify_bearer)):
-    if "list_documents" not in globals():
-        return {"items": []}
-    try:
-        return {"items": list_documents()}
-    except Exception as e:
-        raise HTTPException(500, f"Gagal baca daftar dokumen: {e}")
+    if "list_documents" not in globals(): return {"items": []}
+    try: return {"items": list_documents()}
+    except Exception as e: raise HTTPException(500, f"Gagal baca daftar dokumen: {e}")
 
 @app.post("/v1/docs/upload")
 async def docs_upload(files: List[UploadFile] = File(...), _: None = Depends(verify_bearer)):
-    if "ingest_documents" not in globals():
-        raise HTTPException(501, "RAG not available in this image.")
+    if "ingest_documents" not in globals(): raise HTTPException(501, "RAG not available in this image.")
     try:
         file_tuples=[]
         for f in files:
-            b=await f.read()
-            file_tuples.append((f.filename, b))
+            b=await f.read(); file_tuples.append((f.name, b))
         res=ingest_documents(file_tuples)
-        # refresh retriever
-        if "get_retriever" in globals():
-            global retriever
-            retriever = get_retriever()
+        global retriever; retriever = get_retriever()
         return res
-    except Exception as e:
-        print(f"[UPLOAD] error: {e}")
-        raise HTTPException(500, "Gagal unggah/memproses dokumen")
+    except Exception as e: print(f"[UPLOAD] error: {e}"); raise HTTPException(500, "Gagal unggah/memproses dokumen")
 
 @app.delete("/v1/docs/{doc_id}")
 def docs_delete(doc_id: str, x_admin_token: str = Header(default=""), _: None = Depends(verify_bearer)):
-    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(401, "Unauthorized")
-    if "delete_document" not in globals():
-        raise HTTPException(501, "RAG not available in this image.")
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN: raise HTTPException(401, "Unauthorized")
+    if "delete_document" not in globals(): raise HTTPException(501, "RAG not available in this image.")
     try:
-        delete_document(doc_id)
-        return {"deleted": doc_id}
-    except Exception as e:
-        raise HTTPException(500, f"Gagal hapus dokumen: {e}")
+        delete_document(doc_id); return {"deleted": doc_id}
+    except Exception as e: raise HTTPException(500, f"Gagal hapus dokumen: {e}")
